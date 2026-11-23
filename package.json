@@ -1,0 +1,20 @@
+{
+  "name": "aegis-ronin-3d-platform",
+  "version": "1.0.0",
+  "description": "Two-in-One 3D Web Game Platform: Tactical Strike 3D (FPS/TPS & Zombie Apocalypse) and Ronin of the Wild (3D Samurai Adventure)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node server.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "three": "^0.170.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.7"
+  }
+}
