@@ -609,3 +609,130 @@ export function createNpcMesh(role = 'guard') {
   root.userData = { leftLeg, rightLeg, phase: Math.random() * 10 };
   return root;
 }
+
+// ============================================================
+// 7. STRANGE ASTRA REALM CREATURE & BOSSES (Void Stalker / Magma Warden)
+// ============================================================
+export function createAstraCreatureMesh(isBoss = false) {
+  const root = new THREE.Group();
+  const scale = isBoss ? 1.85 : 1.05;
+  root.scale.setScalar(scale);
+
+  const obsidian = mat(0x18131a, 0.35, 0.72);
+  const magma = mat(0xff4500, 0.2, 0.2, 0xff4500, 2.2);
+  const violet = mat(0xa855f7, 0.25, 0.5, 0xa855f7, 1.5);
+
+  const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.58, 1), obsidian);
+  core.position.y = 1.45;
+  core.castShadow = true;
+
+  const halo = new THREE.Mesh(new THREE.TorusGeometry(0.85, 0.08, 8, 20), isBoss ? magma : violet);
+  halo.position.y = 1.45;
+  halo.rotation.x = Math.PI / 3;
+
+  // 3 Glowing Strange Eyes
+  const eyes = [[-0.22, 1.56, -0.46], [0, 1.66, -0.5], [0.22, 1.56, -0.46]].map(([x, y, z]) => {
+    const e = new THREE.Mesh(new THREE.SphereGeometry(0.085, 8, 8), magma);
+    e.position.set(x, y, z);
+    root.add(e);
+    return e;
+  });
+
+  // Floating Spiked Tentacle Limbs
+  const limbs = [];
+  for (let i = 0; i < 4; i++) {
+    const angle = (i / 4) * Math.PI * 2;
+    const spike = new THREE.Mesh(new THREE.ConeGeometry(0.14, 1.15, 6), obsidian);
+    spike.position.set(Math.cos(angle) * 0.78, 0.95, Math.sin(angle) * 0.78);
+    spike.rotation.z = Math.cos(angle) * 0.5;
+    root.add(spike);
+    limbs.push(spike);
+  }
+
+  // Crown horns for Boss
+  if (isBoss) {
+    [-0.38, 0.38].forEach(hx => {
+      const horn = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.85, 6), magma);
+      horn.position.set(hx, 2.25, 0);
+      horn.rotation.z = hx > 0 ? -0.35 : 0.35;
+      root.add(horn);
+    });
+  }
+
+  root.add(core, halo);
+  root.userData = { core, halo, limbs, eyes, phase: Math.random() * 10 };
+  return root;
+}
+
+// ============================================================
+// 8. MIGHTY DRAGON EMPEROR BOSS (Colossal Celestial Dragon!)
+// ============================================================
+export function createDragonEmperorMesh() {
+  const root = new THREE.Group();
+  const scaleMat = mat(0x991b1b, 0.3, 0.65, 0x7f1d1d, 0.35);
+  const goldMat = mat(0xfbbf24, 0.22, 0.88, 0xf59e0b, 0.45);
+  const fireEye = mat(0xfef08a, 0.1, 0.1, 0xfacc15, 3.0);
+  const wingMat = mat(0xdc2626, 0.5, 0.2, 0x991b1b, 0.4);
+  wingMat.side = THREE.DoubleSide;
+
+  // Serpentine Armored Body Segments
+  const segments = [];
+  for (let i = 0; i < 9; i++) {
+    const radius = Math.max(0.45, 1.35 - i * 0.1);
+    const seg = new THREE.Mesh(new THREE.SphereGeometry(radius, 12, 10), i % 2 === 0 ? scaleMat : goldMat);
+    seg.position.set(0, 4.2 + Math.sin(i * 0.7) * 0.5, i * 1.45);
+    seg.scale.set(1.0, 0.9, 1.25);
+    seg.castShadow = true;
+    // Dorsal dragon spine crest
+    const spine = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.95, 4), goldMat);
+    spine.position.set(0, radius + 0.3, 0);
+    seg.add(spine);
+    root.add(seg);
+    segments.push(seg);
+  }
+
+  // Fierce Sculpted Dragon Head + Imperial Horns + Whiskers + Glowing Eyes
+  const head = new THREE.Group();
+  head.position.set(0, 4.7, -1.65);
+  const skull = new THREE.Mesh(new THREE.BoxGeometry(1.85, 1.45, 2.3), scaleMat);
+  const snout = new THREE.Mesh(new THREE.BoxGeometry(1.35, 0.85, 1.5), scaleMat);
+  snout.position.set(0, -0.18, -1.55);
+  const jaw = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.42, 1.35), goldMat);
+  jaw.position.set(0, -0.78, -1.35);
+  jaw.rotation.x = 0.18;
+
+  const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 8), fireEye);
+  eyeL.position.set(-0.68, 0.25, -0.95);
+  const eyeR = eyeL.clone();
+  eyeR.position.x = 0.68;
+
+  // Twin Royal Antler Horns
+  [-0.65, 0.65].forEach(hx => {
+    const horn = new THREE.Mesh(new THREE.ConeGeometry(0.22, 2.2, 6), goldMat);
+    horn.position.set(hx, 1.35, 0.45);
+    horn.rotation.set(-0.45, 0, hx > 0 ? -0.35 : 0.35);
+    head.add(horn);
+  });
+  head.add(skull, snout, jaw, eyeL, eyeR);
+  root.add(head);
+
+  // Massive Flapping Dragon Wings
+  const wingL = new THREE.Group();
+  wingL.position.set(-1.3, 4.9, 1.2);
+  const wMeshL = new THREE.Mesh(new THREE.PlaneGeometry(6.8, 3.6), wingMat);
+  wMeshL.position.set(-3.4, 0.4, 0.5);
+  wMeshL.rotation.x = -Math.PI / 2 + 0.35;
+  wingL.add(wMeshL);
+
+  const wingR = new THREE.Group();
+  wingR.position.set(1.3, 4.9, 1.2);
+  const wMeshR = new THREE.Mesh(new THREE.PlaneGeometry(6.8, 3.6), wingMat);
+  wMeshR.position.set(3.4, 0.4, 0.5);
+  wMeshR.rotation.x = -Math.PI / 2 + 0.35;
+  wingR.add(wMeshR);
+
+  root.add(wingL, wingR);
+
+  root.userData = { head, segments, wingL, wingR, phase: 0 };
+  return root;
+}

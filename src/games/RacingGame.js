@@ -276,6 +276,20 @@ export class RacingGame {
     this.callbacks.onPauseChange?.(paused);
   }
 
+  // --- MOBILE TOUCH CONTROL APIS ---
+
+  setTouchKey(code, pressed) {
+    if (pressed) audio.init();
+    this.keys[code] = Boolean(pressed);
+  }
+
+  triggerTouchAction(action) {
+    if (this.isPaused || this.raceFinished || this.role !== 'racer') return;
+    audio.init();
+    if (action === 'shoot') this._firePrimaryBlaster();
+    else if (action === 'special_op') this._useSpecialOp();
+  }
+
   // --- TRACK GEOMETRY, CRAZY ROADS, HIDDEN SHORTCUTS & THEMED SCENERY ---
 
   _clearTrack() {

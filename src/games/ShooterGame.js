@@ -151,9 +151,12 @@ export class ShooterGame {
     this.shakeTime = 0;
     this.shakeIntensity = 0;
 
-    // Input state
+    // Input state (Keyboard/Mouse + Mobile Touch Joystick/Look)
     this.keys = {};
     this.mouseDown = false;
+    this.touchMoveX = 0;
+    this.touchMoveY = 0;
+    this.touchFire = false;
     this.lastNetSync = 0;
 
     // Local 3D player mesh (for TPS view) + FP weapon holder + Torch Spotlight
@@ -326,8 +329,67 @@ export class ShooterGame {
   }
 
   requestPointerLock() {
+    if ('ontouchstart' in window && navigator.maxTouchPoints > 0) return;
     if (!this.isPaused && !this.matchEnded && this.renderer?.domElement) {
       this.renderer.domElement.requestPointerLock?.();
+    }
+  }
+
+  // --- MOBILE TOUCH CONTROL APIS ---
+
+  setTouchMove(x, y) {
+    this.touchMoveX = x;
+    this.touchMoveY = y;
+  }
+
+  addTouchLook(dx, dy) {
+    if (this.isPaused || this.matchEnded) return;
+    const sens = this.player.aiming ? 0.0032 : 0.0052;
+    this.player.yaw -= dx * sens;
+    this.player.pitch = Math.max(-1.35, Math.min(1.35, this.player.pitch - dy * sens));
+  }
+
+  setTouchFire(down) {
+    this.touchFire = down;
+    if (down && !this.isPaused && !this.matchEnded) {
+      audio.init();
+      this._shoot();
+    }
+  }
+
+  setTouchAim(down) {
+    this.player.aiming = down;
+  }
+
+  triggerTouchAction(action) {
+    if (this.isPaused || this.matchEnded) return;
+    audio.init();
+    const p = this.player;
+    if (action === 'jump' && p.grounded && p.alive) {
+      p.vel.y = 9.2;
+      p.grounded = false;
+    } else if (action === 'bomb') {
+      this._throwGrenade();
+    } else if (action === 'reload') {
+      this._startReload();
+    } else if (action === 'punch') {
+      this._meleePunch();
+    } else if (action === 'torch') {
+      p.torchOn = !p.torchOn;
+      this.torchLight.intensity = p.torchOn ? 65 : 0;
+      audio.playFlashlightClick();
+      this._pushHud();
+    } else if (action === 'slide' && !p.sliding && p.grounded && p.alive) {
+      const fwd = new THREE.Vector3(-Math.sin(p.yaw), 0, -Math.cos(p.yaw)).normalize();
+      p.sliding = true;
+      p.slideTimer = 0.55;
+      p.slideDir.copy(fwd);
+      audio.playSlide();
+      this.callbacks.onCombo?.('COMBO: TACTICAL POWER SLIDE!');
+    } else if (action === 'next_weapon') {
+      const order = ['rifle', 'shotgun', 'pistol'];
+      const next = order[(order.indexOf(p.weaponKey) + 1) % order.length];
+      this._selectWeapon(next);
     }
   }
 
@@ -1416,9 +1478,14 @@ export class ShooterGame {
       if (this.keys['KeyS'] || this.keys['ArrowDown']) move.sub(fwd);
       if (this.keys['KeyD'] || this.keys['ArrowRight']) move.add(right);
       if (this.keys['KeyA'] || this.keys['ArrowLeft']) move.sub(right);
-      if (move.lengthSq() > 0) move.normalize();
+      if (Math.abs(this.touchMoveX) > 0.08 || Math.abs(this.touchMoveY) > 0.08) {
+        move.addScaledVector(fwd, this.touchMoveY);
+        move.addScaledVector(right, this.touchMoveX);
+      }
+      if (move.lengthSq() > 1) move.normalize();
 
-      const sprinting = (this.keys['ShiftLeft'] || this.keys['ShiftRight']) && !p.aiming;
+      const joySprint = Math.hypot(this.touchMoveX, this.touchMoveY) > 0.85;
+      const sprinting = (this.keys['ShiftLeft'] || this.keys['ShiftRight'] || joySprint) && !p.aiming;
 
       if (p.sliding) {
         p.slideTimer -= dt;
@@ -1459,8 +1526,8 @@ export class ShooterGame {
 
       this._resolveHorizontalCollision(p.pos, 0.56);
 
-      // Continuous fire if holding LMB with automatic weapon
-      if (this.mouseDown && WEAPONS[p.weaponKey].auto) {
+      // Continuous fire if holding LMB or Mobile Fire button
+      if ((this.mouseDown || this.touchFire) && WEAPONS[p.weaponKey].auto) {
         this._shoot();
       }
     }

@@ -1,23 +1,40 @@
-// WebSocket Multiplayer Client for Shooter Rooms + FPS Combat Racing Rooms, Spectators & Leaderboard
+// Universal Cloud + Local Multiplayer Client
+// Works seamlessly on Vercel (/api/multiplayer serverless relay) AND locally (Express server.js)!
 
 export class MultiplayerClient {
   constructor() {
-    this.ws = null;
     this.connected = false;
-    this.playerId = this._generateLocalId();
+    this.mode = 'cloud';
+    this.playerId = this._loadOrCreatePlayerId();
     this.roomState = null;
     this.raceRoomState = null;
     this.raceRole = null; // 'racer' | 'spectator'
+    this.shooterRoomsList = [];
     this.raceRoomsList = [];
     this.raceLeaderboard = this._loadLocalLeaderboard();
     this.handlers = new Map();
+
+    this._dirTimer = null;
+    this._syncTimer = null;
+    this._lastEventId = 0;
+    this._pendingShooterPos = null;
+    this._pendingShooterHit = null;
+    this._pendingRacePos = null;
+    this._pendingRaceHit = null;
+    this._syncBusy = false;
   }
 
-  _generateLocalId() {
+  _loadOrCreatePlayerId() {
+    try {
+      const saved = sessionStorage.getItem('aegis_player_id');
+      if (saved) return saved;
+    } catch {}
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let s = '';
     for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    return `OP-${s}`;
+    const id = `OP-${s}`;
+    try { sessionStorage.setItem('aegis_player_id', id); } catch {}
+    return id;
   }
 
   _loadLocalLeaderboard() {
@@ -34,10 +51,9 @@ export class MultiplayerClient {
   }
 
   _saveLocalLeaderboard(list) {
+    if (!Array.isArray(list)) return;
     this.raceLeaderboard = list;
-    try {
-      localStorage.setItem('apex_blur_leaderboard_v1', JSON.stringify(list));
-    } catch {}
+    try { localStorage.setItem('apex_blur_leaderboard_v1', JSON.stringify(list)); } catch {}
   }
 
   on(event, fn) {
@@ -51,172 +67,277 @@ export class MultiplayerClient {
     if (set) set.forEach(fn => fn(data));
   }
 
-  connect() {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${protocol}://${window.location.host}/ws`;
-
-    try {
-      this.ws = new WebSocket(url);
-    } catch {
-      this.connected = false;
-      this.emit('status', { connected: false, playerId: this.playerId });
-      return;
-    }
-
-    this.ws.onopen = () => {
-      this.connected = true;
-      this.emit('status', { connected: true, playerId: this.playerId });
-    };
-
-    this.ws.onmessage = (evt) => {
-      let data;
-      try {
-        data = JSON.parse(evt.data);
-      } catch {
-        return;
-      }
-      if (data.type === 'welcome') {
-        this.playerId = data.playerId;
-        if (Array.isArray(data.raceRooms)) this.raceRoomsList = data.raceRooms;
-        if (Array.isArray(data.raceLeaderboard)) this._saveLocalLeaderboard(data.raceLeaderboard);
-        this.emit('status', { connected: true, playerId: this.playerId });
-      } else if (data.type === 'joined_room') {
-        this.roomState = data.state;
-        this.emit('joined_room', data);
-      } else if (data.type === 'room_state') {
-        this.roomState = data.state;
-        this.emit('room_state', data.state);
-      } else if (data.type === 'race_rooms_list') {
-        this.raceRoomsList = data.rooms || [];
-        this.emit('race_rooms_list', this.raceRoomsList);
-      } else if (data.type === 'race_leaderboard') {
-        this._saveLocalLeaderboard(data.leaderboard || []);
-        this.emit('race_leaderboard', this.raceLeaderboard);
-      } else if (data.type === 'race_joined') {
-        this.raceRoomState = data.state;
-        this.raceRole = data.role;
-        this.emit('race_joined', data);
-      } else if (data.type === 'race_room_state' || data.type === 'race_locked_start') {
-        this.raceRoomState = data.state;
-        this.emit(data.type, data.state);
-      } else {
-        this.emit(data.type, data);
-      }
-    };
-
-    this.ws.onclose = () => {
-      this.connected = false;
-      this.emit('status', { connected: false, playerId: this.playerId });
-      setTimeout(() => this.connect(), 3500);
-    };
-
-    this.ws.onerror = () => {
-      this.connected = false;
-    };
+  async _api(payload) {
+    const res = await fetch('/api/multiplayer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, playerId: this.playerId })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
   }
 
+  connect() {
+    this._refreshDirectory();
+    if (!this._dirTimer) {
+      this._dirTimer = setInterval(() => this._refreshDirectory(), 2200);
+    }
+    if (!this._syncTimer) {
+      this._syncTimer = setInterval(() => this._tickRoomSync(), 180);
+    }
+  }
+
+  async _refreshDirectory() {
+    try {
+      const data = await this._api({ type: 'directory' });
+      const wasConnected = this.connected;
+      this.connected = true;
+      if (Array.isArray(data.shooterRooms)) {
+        this.shooterRoomsList = data.shooterRooms;
+        this.emit('shooter_rooms_list', this.shooterRoomsList);
+      }
+      if (Array.isArray(data.raceRooms)) {
+        this.raceRoomsList = data.raceRooms;
+        this.emit('race_rooms_list', this.raceRoomsList);
+      }
+      if (Array.isArray(data.raceLeaderboard)) {
+        this._saveLocalLeaderboard(data.raceLeaderboard);
+        this.emit('race_leaderboard', this.raceLeaderboard);
+      }
+      if (!wasConnected) {
+        this.emit('status', { connected: true, playerId: this.playerId });
+      }
+    } catch {
+      if (this.connected) {
+        this.connected = false;
+        this.emit('status', { connected: false, playerId: this.playerId });
+      }
+    }
+  }
+
+  async _tickRoomSync() {
+    if (this._syncBusy) return;
+    if (!this.roomState && !this.raceRoomState) return;
+    this._syncBusy = true;
+    try {
+      if (this.roomState) {
+        const pos = this._pendingShooterPos;
+        const hit = this._pendingShooterHit;
+        this._pendingShooterPos = null;
+        this._pendingShooterHit = null;
+
+        const res = await this._api({
+          type: 'shooter_sync',
+          roomId: this.roomState.roomId,
+          pos,
+          hit,
+          sinceEventId: this._lastEventId
+        });
+        if (res.ok && res.state) {
+          this.roomState = res.state;
+          this.emit('room_state', res.state);
+          for (const pl of res.state.players || []) {
+            if (pl.id !== this.playerId) {
+              this.emit('player_moved', pl);
+            }
+          }
+          for (const ev of res.events || []) {
+            this._lastEventId = Math.max(this._lastEventId, ev.id);
+            this.emit(ev.payload.type, ev.payload);
+          }
+        }
+      } else if (this.raceRoomState) {
+        const pos = this._pendingRacePos;
+        const combatHit = this._pendingRaceHit;
+        this._pendingRacePos = null;
+        this._pendingRaceHit = null;
+
+        const res = await this._api({
+          type: 'race_sync',
+          roomId: this.raceRoomState.roomId,
+          pos,
+          combatHit,
+          sinceEventId: this._lastEventId
+        });
+        if (res.ok && res.state) {
+          const prevLocked = this.raceRoomState.locked;
+          this.raceRoomState = res.state;
+          this.emit('race_room_state', res.state);
+          if (!prevLocked && res.state.locked) {
+            this.emit('race_locked_start', res.state);
+          }
+          for (const r of res.state.racers || []) {
+            if (r.id !== this.playerId) {
+              this.emit('race_racer_moved', r);
+            }
+          }
+          for (const ev of res.events || []) {
+            this._lastEventId = Math.max(this._lastEventId, ev.id);
+            this.emit(ev.payload.type, ev.payload);
+          }
+        }
+      }
+    } catch {}
+    this._syncBusy = false;
+  }
+
+  // Unified send() used by ShooterGame & RacingGame for movement/combat updates
   send(payload) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
+    if (!payload) return false;
+    if (payload.type === 'state_update') {
+      this._pendingShooterPos = payload;
       return true;
     }
-    return false;
+    if (payload.type === 'hit_player') {
+      this._pendingShooterHit = payload;
+      return true;
+    }
+    if (payload.type === 'race_state_update') {
+      this._pendingRacePos = payload;
+      return true;
+    }
+    if (payload.type === 'race_combat_hit') {
+      this._pendingRaceHit = payload;
+      return true;
+    }
+    if (payload.type === 'get_race_leaderboard') {
+      this._refreshDirectory();
+      return true;
+    }
+    return true;
   }
 
-  // --- Shooter Room Helpers ---
-  createRoom(scene = 'forest', name = '') {
-    if (!this.send({ type: 'create_room', scene, name: name || this.playerId })) {
-      const localRoomId = `RM-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-      const state = {
-        roomId: localRoomId,
-        scene,
-        level: 1,
-        routingLabel: '1v0 Local Arena + Bots',
-        timeLeft: 300,
-        players: [{
-          id: this.playerId, name: name || this.playerId, team: 'ALPHA',
-          x: -20, y: 1.8, z: -20, yaw: 0, pitch: 0,
-          hp: 100, maxHp: 100, kills: 0, deaths: 0,
-          weapon: 'rifle', sliding: false, alive: true
-        }]
-      };
-      this.roomState = state;
-      this.emit('joined_room', { playerId: this.playerId, spawn: { x: -20, y: 1.8, z: -20 }, state });
+  // --- SHOOTER ROOMS ---
+  async createRoom(scene = 'forest', name = '') {
+    try {
+      this._lastEventId = 0;
+      const res = await this._api({ type: 'create_room', scene, name: name || this.playerId });
+      if (!res.ok) {
+        this.emit('error', { message: res.error || 'Could not create shooter room.' });
+        return;
+      }
+      this.connected = true;
+      this.roomState = res.state;
+      if (res.shooterRooms) this.shooterRoomsList = res.shooterRooms;
+      this.emit('shooter_lobby_entered', { playerId: this.playerId, spawn: res.spawn, state: res.state, isHost: true });
+    } catch {
+      this.emit('error', { message: 'Could not reach multiplayer relay. Retrying...' });
     }
   }
 
-  joinRoom(roomId, name = '') {
-    if (!this.send({ type: 'join_room', roomId, name: name || this.playerId })) {
-      this.emit('error', { message: 'Multiplayer server offline. Start server with npm start to join rooms.' });
+  async joinRoom(roomId, name = '') {
+    try {
+      this._lastEventId = 0;
+      const res = await this._api({ type: 'join_room', roomId, name: name || this.playerId });
+      if (!res.ok) {
+        this.emit('error', { message: res.error || 'Room not found.' });
+        return;
+      }
+      this.connected = true;
+      this.roomState = res.state;
+      if (res.state.started) {
+        this.emit('joined_room', { playerId: this.playerId, spawn: res.spawn, state: res.state });
+      } else {
+        this.emit('shooter_lobby_entered', { playerId: this.playerId, spawn: res.spawn, state: res.state, isHost: false });
+      }
+    } catch {
+      this.emit('error', { message: 'Could not join room. Check connection and try again.' });
     }
   }
 
-  leaveRoom() {
-    this.send({ type: 'leave_room' });
+  async startShooterMatch() {
+    if (!this.roomState) return;
+    try {
+      const res = await this._api({ type: 'shooter_start_match', roomId: this.roomState.roomId });
+      if (res.ok && res.state) {
+        this.roomState = res.state;
+        this.emit('shooter_started', { state: res.state });
+      }
+    } catch {}
+  }
+
+  async leaveRoom() {
+    if (!this.roomState) return;
+    const rid = this.roomState.roomId;
     this.roomState = null;
+    try {
+      await this._api({ type: 'leave_room', roomId: rid });
+      this._refreshDirectory();
+    } catch {}
   }
 
-  // --- Racing Room Helpers ---
-  createRaceRoom({ name, carId, trackId, maxPlayers }) {
-    const cleanName = (name || this.playerId).trim().slice(0, 18) || this.playerId;
-    if (!this.send({ type: 'race_create_room', name: cleanName, carId, trackId, maxPlayers })) {
-      const laps = { asia: 4, nigeria: 6, morocco: 4, egypt: 8 }[trackId] || 4;
-      const state = {
-        roomId: `RC-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
-        hostId: this.playerId,
-        trackId,
-        totalLaps: laps,
-        maxPlayers,
-        locked: true,
-        started: true,
-        racerCount: 1,
-        spectatorCount: 0,
-        racers: [{
-          id: this.playerId, name: cleanName, carId, gridIndex: 0,
-          x: 0, y: 0, z: 0, yaw: 0, speed: 0, lap: 1, progress: 0,
-          hp: 100, alive: true, drifting: false, nitro: false, takedowns: 0
-        }]
-      };
-      this.raceRoomState = state;
+  // --- RACING ROOMS ---
+  async createRaceRoom({ name, carId, trackId, maxPlayers }) {
+    try {
+      this._lastEventId = 0;
+      const cleanName = (name || this.playerId).trim().slice(0, 18) || this.playerId;
+      const res = await this._api({ type: 'race_create_room', name: cleanName, carId, trackId, maxPlayers });
+      if (!res.ok) {
+        this.emit('error', { message: res.error || 'Could not create race room.' });
+        return;
+      }
+      this.connected = true;
+      this.raceRoomState = res.state;
       this.raceRole = 'racer';
-      this.emit('race_joined', { role: 'racer', playerId: this.playerId, state });
+      if (res.raceRooms) this.raceRoomsList = res.raceRooms;
+      this.emit('race_lobby_entered', { role: 'racer', playerId: this.playerId, state: res.state, isHost: true });
+    } catch {
+      this.emit('error', { message: 'Could not reach multiplayer relay. Retrying...' });
     }
   }
 
-  joinRaceRoom({ roomId, name, carId }) {
-    const cleanName = (name || this.playerId).trim().slice(0, 18) || this.playerId;
-    if (!this.send({ type: 'race_join_room', roomId, name: cleanName, carId })) {
-      this.emit('error', { message: 'Multiplayer server offline. Cannot join remote Race Room.' });
+  async joinRaceRoom({ roomId, name, carId }) {
+    try {
+      this._lastEventId = 0;
+      const cleanName = (name || this.playerId).trim().slice(0, 18) || this.playerId;
+      const res = await this._api({ type: 'race_join_room', roomId, name: cleanName, carId });
+      if (!res.ok) {
+        this.emit('error', { message: res.error || 'Race room not found.' });
+        return;
+      }
+      this.connected = true;
+      this.raceRoomState = res.state;
+      this.raceRole = res.role;
+      // Spectators or already-started/full rooms jump straight into live 3D race!
+      if (res.role === 'spectator' || res.state.started || res.state.locked) {
+        this.emit('race_joined', { role: res.role, reason: res.reason || '', playerId: this.playerId, state: res.state });
+      } else {
+        this.emit('race_lobby_entered', { role: 'racer', playerId: this.playerId, state: res.state, isHost: false });
+      }
+    } catch {
+      this.emit('error', { message: 'Could not join race room. Please try again.' });
     }
   }
 
-  lockAndStartRace() {
-    this.send({ type: 'race_lock_and_start' });
+  async lockAndStartRace() {
+    if (!this.raceRoomState) return;
+    try {
+      const res = await this._api({ type: 'race_lock_and_start', roomId: this.raceRoomState.roomId });
+      if (res.ok && res.state) {
+        this.raceRoomState = res.state;
+        this.emit('race_locked_start', res.state);
+      }
+    } catch {}
   }
 
-  leaveRaceRoom() {
-    this.send({ type: 'race_leave_room' });
+  async leaveRaceRoom() {
+    if (!this.raceRoomState) return;
+    const rid = this.raceRoomState.roomId;
     this.raceRoomState = null;
     this.raceRole = null;
+    try {
+      await this._api({ type: 'race_leave_room', roomId: rid });
+      this._refreshDirectory();
+    } catch {}
   }
 
-  submitRaceResult(result) {
-    if (!this.send({ type: 'race_submit_result', ...result }) && result.won) {
-      const list = [...this.raceLeaderboard];
-      list.push({
-        name: result.name,
-        carId: result.carId,
-        trackId: result.trackId,
-        timeSec: Number(result.timeSec.toFixed(2)),
-        takedowns: result.takedowns || 0,
-        trophies: 1,
-        date: new Date().toLocaleDateString()
-      });
-      list.sort((a, b) => b.trophies - a.trophies || a.timeSec - b.timeSec);
-      this._saveLocalLeaderboard(list.slice(0, 25));
-    }
+  async submitRaceResult(result) {
+    try {
+      const res = await this._api({ type: 'race_submit_result', ...result });
+      if (res.ok && Array.isArray(res.raceLeaderboard)) {
+        this._saveLocalLeaderboard(res.raceLeaderboard);
+        this.emit('race_leaderboard', this.raceLeaderboard);
+      }
+    } catch {}
   }
 }

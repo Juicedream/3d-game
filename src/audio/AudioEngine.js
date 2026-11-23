@@ -712,6 +712,63 @@ export class AudioEngine {
     });
   }
 
+  playPortalFall() {
+    this.init();
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(520, now);
+    osc.frequency.exponentialRampToValueAtTime(58, now + 1.8);
+    g.gain.setValueAtTime(0.01, now);
+    g.gain.linearRampToValueAtTime(0.55, now + 0.25);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 1.9);
+    osc.connect(g);
+    g.connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + 1.95);
+
+    const wind = this.ctx.createBufferSource();
+    wind.buffer = this.noiseBuffer;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1600, now);
+    bp.frequency.exponentialRampToValueAtTime(220, now + 1.8);
+    const wg = this.ctx.createGain();
+    wg.gain.setValueAtTime(0.45, now);
+    wg.gain.exponentialRampToValueAtTime(0.001, now + 1.85);
+    wind.connect(bp);
+    bp.connect(wg);
+    wg.connect(this.sfxGain);
+    wind.start(now);
+    wind.stop(now + 1.9);
+  }
+
+  playEyeLaser() {
+    this.init();
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const osc2 = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc2.type = 'square';
+    osc.frequency.setValueAtTime(880, now);
+    osc.frequency.exponentialRampToValueAtTime(340, now + 0.35);
+    osc2.frequency.setValueAtTime(1320, now);
+    osc2.frequency.exponentialRampToValueAtTime(520, now + 0.35);
+    g.gain.setValueAtTime(0.32, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
+    osc.connect(g);
+    osc2.connect(g);
+    g.connect(this.sfxGain);
+    osc.start(now);
+    osc2.start(now);
+    osc.stop(now + 0.4);
+    osc2.stop(now + 0.4);
+  }
+
   _playClick(time, freq, dur, vol) {
     const osc = this.ctx.createOscillator();
     const g = this.ctx.createGain();

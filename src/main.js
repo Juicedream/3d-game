@@ -6,9 +6,16 @@ import { RacingGame, RACE_TRACKS } from './games/RacingGame.js';
 import { CAR_CATALOG, getCarSpec } from './engine/CarMesh.js';
 import { CarShowroom } from './ui/CarShowroom.js';
 import { renderComicIntro } from './ui/ComicIntro.js';
+import { MobileControls } from './ui/MobileControls.js';
 
 const canvasRoot = document.getElementById('game-canvas-root');
 const uiRoot = document.getElementById('ui-root');
+const mobileRoot = document.getElementById('mobile-controls-root');
+const mobileControls = new MobileControls(mobileRoot);
+
+if (mobileControls.enabled) {
+  document.body.classList.add('touch-active');
+}
 
 const mp = new MultiplayerClient();
 mp.connect();
@@ -18,12 +25,16 @@ let activeGameType = null; // 'shooter' | 'samurai' | 'racing'
 let activeHubTab = 'racing'; // 'racing' | 'shooter' | 'samurai'
 let carShowroom = null;
 
+// Waiting Lobby state (when Hosting or waiting before launch!)
+let waitingLobby = null; // { kind: 'racing'|'shooter', isHost, spawn, state }
+
 let selectedScene = 'forest';
-let racePlayerName = localStorage.getItem('apex_blur_driver_name') || '';
+let playerDisplayName = localStorage.getItem('apex_blur_driver_name') || '';
 let selectedTrackId = 'asia';
 let selectedCarId = 'valkyrie';
 let selectedMaxPlayers = 4;
 let showLeaderboardModal = false;
+let elderDialogueData = null;
 
 let hubError = '';
 let comboTimer = null;
@@ -91,7 +102,6 @@ function disposeShowroom() {
   }
 }
 
-// Global M key for quick audio mute
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyM' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'SELECT') {
     audio.toggleMute();
@@ -100,17 +110,23 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+// --- MULTIPLAYER CLOUD EVENTS ---
+
 mp.on('status', () => {
   if (!activeGame) {
     const pill = uiRoot.querySelector('#hub-id-pill');
     if (pill) {
-      pill.innerHTML = `<span class="dot ${mp.connected ? '' : 'offline'}"></span> YOUR ID: <span>${mp.playerId}</span>`;
+      pill.innerHTML = `<span class="dot ${mp.connected ? '' : 'offline'}"></span> ${mp.connected ? 'ONLINE' : 'CONNECTING'} • ID: <span>${mp.playerId}</span>`;
     }
   }
 });
 
 mp.on('race_rooms_list', () => {
-  if (!activeGame && activeHubTab === 'racing') updateLiveRoomsList();
+  if (!activeGame && !waitingLobby && activeHubTab === 'racing') refreshRaceDropdown();
+});
+
+mp.on('shooter_rooms_list', () => {
+  if (!activeGame && !waitingLobby && activeHubTab === 'shooter') refreshShooterDropdown();
 });
 
 mp.on('race_leaderboard', () => {
@@ -122,16 +138,86 @@ mp.on('error', ({ message }) => {
   if (!activeGame) renderHub();
 });
 
+// Host / Joiner enters Waiting Lobby (shows only Host + Waiting for others + Enter Game Now button!)
+mp.on('shooter_lobby_entered', ({ spawn, state, isHost }) => {
+  hubError = '';
+  waitingLobby = { kind: 'shooter', isHost, spawn, state };
+  renderHub();
+});
+
+mp.on('race_lobby_entered', ({ state, isHost }) => {
+  hubError = '';
+  waitingLobby = { kind: 'racing', isHost, state };
+  renderHub();
+});
+
+// Live updates while inside Waiting Lobby
+mp.on('room_state', (state) => {
+  if (waitingLobby && waitingLobby.kind === 'shooter') {
+    waitingLobby.state = state;
+    if (state.started) {
+      const sp = waitingLobby.spawn;
+      waitingLobby = null;
+      launchShooter('arena', state.scene, sp);
+    } else {
+      renderHub();
+    }
+  }
+});
+
+mp.on('shooter_started', ({ state }) => {
+  if (waitingLobby && waitingLobby.kind === 'shooter') {
+    const sp = waitingLobby.spawn;
+    waitingLobby = null;
+    launchShooter('arena', state.scene, sp);
+  }
+});
+
+mp.on('race_room_state', (state) => {
+  if (waitingLobby && waitingLobby.kind === 'racing') {
+    waitingLobby.state = state;
+    if (state.started || state.locked) {
+      waitingLobby = null;
+      launchRacing({
+        trackId: state.trackId,
+        playerName: playerDisplayName || mp.playerId,
+        carId: selectedCarId,
+        role: 'racer',
+        roomState: state,
+        joinNotice: ''
+      });
+    } else {
+      renderHub();
+    }
+  }
+});
+
+mp.on('race_locked_start', (state) => {
+  if (waitingLobby && waitingLobby.kind === 'racing') {
+    waitingLobby = null;
+    launchRacing({
+      trackId: state.trackId,
+      playerName: playerDisplayName || mp.playerId,
+      carId: selectedCarId,
+      role: 'racer',
+      roomState: state,
+      joinNotice: ''
+    });
+  }
+});
+
 mp.on('joined_room', ({ spawn, state }) => {
   hubError = '';
+  waitingLobby = null;
   launchShooter('arena', state.scene, spawn);
 });
 
 mp.on('race_joined', ({ role, reason, state }) => {
   hubError = '';
+  waitingLobby = null;
   launchRacing({
     trackId: state.trackId,
-    playerName: racePlayerName || mp.playerId,
+    playerName: playerDisplayName || mp.playerId,
     carId: selectedCarId,
     role,
     roomState: state,
@@ -139,37 +225,46 @@ mp.on('race_joined', ({ role, reason, state }) => {
   });
 });
 
-function updateLiveRoomsList() {
-  const host = uiRoot.querySelector('#live-rooms-host');
-  if (!host) return;
-  const liveRooms = mp.raceRoomsList || [];
-  if (liveRooms.length === 0) {
-    host.innerHTML = '';
+// --- LIVE DROPDOWN UPDATERS (ROOM ID + HOST NAME FOR OTHER DEVICES!) ---
+
+function refreshRaceDropdown() {
+  const sel = uiRoot.querySelector('#race-rooms-dropdown');
+  if (!sel) return;
+  const prev = sel.value;
+  const rooms = mp.raceRoomsList || [];
+  if (rooms.length === 0) {
+    sel.innerHTML = `<option value="">No active hosted races yet — Host one above!</option>`;
     return;
   }
-  host.innerHTML = `
-    <div class="live-rooms-list">
-      ${liveRooms.map(rm => `
-        <div class="live-room-item">
-          <span><strong>${rm.roomId}</strong> • ${rm.trackId.toUpperCase()} (${rm.totalLaps}L) • ${rm.racerCount}/${rm.maxPlayers} Racers ${rm.spectatorCount > 0 ? `• 👁️ ${rm.spectatorCount}` : ''}</span>
-          <button class="btn ${rm.locked ? 'btn-secondary' : 'btn-pink'}" style="padding:5px 10px; font-size:0.72rem;" data-quick-race="${rm.roomId}">
-            ${rm.locked ? '👁️ Spectate' : 'Join Race'}
-          </button>
-        </div>
-      `).join('')}
-    </div>
+  sel.innerHTML = `
+    <option value="">— Select Hosted Race Room (${rooms.length} Live) —</option>
+    ${rooms.map(rm => `
+      <option value="${rm.roomId}">
+        ${rm.roomId} — Host: ${rm.hostName || 'Host'} | ${rm.trackId.toUpperCase()} (${rm.totalLaps}L) | ${rm.racerCount}/${rm.maxPlayers} ${rm.locked ? '🔒 [SPECTATE LIVE]' : '🟢 [OPEN]'}
+      </option>
+    `).join('')}
   `;
-  host.querySelectorAll('[data-quick-race]').forEach(btn => {
-    btn.onclick = () => {
-      audio.init();
-      hubError = '';
-      mp.joinRaceRoom({
-        roomId: btn.dataset.quickRace,
-        name: (racePlayerName || mp.playerId).trim(),
-        carId: selectedCarId
-      });
-    };
-  });
+  if (prev && rooms.some(r => r.roomId === prev)) sel.value = prev;
+}
+
+function refreshShooterDropdown() {
+  const sel = uiRoot.querySelector('#shooter-rooms-dropdown');
+  if (!sel) return;
+  const prev = sel.value;
+  const rooms = mp.shooterRoomsList || [];
+  if (rooms.length === 0) {
+    sel.innerHTML = `<option value="">No active shooter rooms yet — Host one above!</option>`;
+    return;
+  }
+  sel.innerHTML = `
+    <option value="">— Select Hosted Shooter Room (${rooms.length} Live) —</option>
+    ${rooms.map(rm => `
+      <option value="${rm.roomId}">
+        ${rm.roomId} — Host: ${rm.hostName || 'Host'} | ${rm.scene.toUpperCase()} | ${rm.playerCount} Player${rm.playerCount === 1 ? '' : 's'} ${rm.started ? '[IN GAME]' : '[WAITING]'}
+      </option>
+    `).join('')}
+  `;
+  if (prev && rooms.some(r => r.roomId === prev)) sel.value = prev;
 }
 
 function updateCarInfoUi() {
@@ -210,6 +305,60 @@ function renderHub() {
   const tracks = Object.values(RACE_TRACKS);
   const currentCar = getCarSpec(selectedCarId);
 
+  // HOST WAITING ROOM OVERLAY (Shows Host Only + Waiting for Others + Option to Enter Game Immediately!)
+  let lobbyModalHtml = '';
+  if (waitingLobby) {
+    const st = waitingLobby.state;
+    const isRace = waitingLobby.kind === 'racing';
+    const members = isRace ? (st.racers || []) : (st.players || []);
+    const title = isRace ? `🏎️ RACE LOBBY — ${st.trackId.toUpperCase()} (${st.totalLaps} LAPS)` : `🔫 SHOOTER LOBBY — ${st.scene.toUpperCase()}`;
+
+    lobbyModalHtml = `
+      <div class="modal-backdrop">
+        <div class="modal-card">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="modal-title" style="color:${isRace ? '#f9a8d4' : '#38bdf8'};">${title}</div>
+            <span class="id-pill">ROOM: ${st.roomId}</span>
+          </div>
+
+          <div class="waiting-pulse">
+            <span class="dot"></span>
+            <span>
+              HOST: <strong>${st.hostName || 'Host'}</strong> •
+              ${members.length === 1
+                ? 'Only Host in room — Waiting for other players to pick this room from the dropdown...'
+                : `${members.length} player${members.length > 1 ? 's' : ''} connected!${isRace ? ` (Max ${st.maxPlayers} — locks automatically when full)` : ''}`}
+            </span>
+          </div>
+
+          <div class="lobby-roster">
+            <div class="section-label" style="margin-bottom:2px;">PLAYERS IN ROOM (${members.length}${isRace ? ` / ${st.maxPlayers}` : ''})</div>
+            ${members.map(m => `
+              <div class="lobby-player-row">
+                <span>${m.id === st.hostId ? '👑 ' : '🎮 '}${m.name} ${m.id === mp.playerId ? '(You)' : ''}</span>
+                <span style="color:#94a3b8; font-size:0.76rem;">${isRace ? getCarSpec(m.carId).name : `TEAM ${m.team}`}</span>
+              </div>
+            `).join('')}
+          </div>
+
+          <p style="font-size:0.8rem; color:#94a3b8;">
+            Others on their own devices will see <strong>"${st.roomId} — Host: ${st.hostName || 'Host'}"</strong> in the Room Dropdown.
+            ${waitingLobby.isHost ? 'You can wait for them OR enter the game right now without waiting!' : 'Waiting for the Host to launch the match...'}
+          </p>
+
+          <div class="btn-row">
+            ${waitingLobby.isHost ? `
+              <button class="btn ${isRace ? 'btn-pink' : 'btn-primary'}" id="lobby-enter-now">
+                ▶ Enter Game Now ${members.length === 1 ? '(Without Waiting)' : `(${members.length} Players)`}
+              </button>
+            ` : ''}
+            <button class="btn btn-secondary" id="lobby-leave">✕ Leave Lobby</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   const lbModalHtml = showLeaderboardModal ? `
     <div class="modal-backdrop">
       <div class="modal-card">
@@ -242,7 +391,6 @@ function renderHub() {
   if (activeHubTab === 'racing') {
     stageHtml = `
       <div class="hub-stage">
-        <!-- LEFT: LIVE 3D ROLLING CAR SHOWROOM GARAGE -->
         <div class="stage-panel">
           <div style="display:flex; justify-content:space-between; align-items:center;">
             <span class="card-badge badge-pink">3D Interactive Garage • Roll &amp; Choose</span>
@@ -266,19 +414,17 @@ function renderHub() {
           <div class="car-spec-bars" id="showroom-car-bars"></div>
         </div>
 
-        <!-- RIGHT: TRACK, DRIVER NAME, MAX PLAYERS & MULTIPLAYER LAUNCH -->
         <div class="stage-panel">
           <div>
             <div class="card-title">APEX BLUR 3D RACING</div>
             <p class="card-desc" style="margin-top:4px;">
-              Drive inside the <strong>First-Person Cockpit</strong> or <strong>Car View [V]</strong> across crazy roads,
-              <strong>hidden shortcuts</strong>, drift &amp; nitro boosts, road Special Ops &amp; <strong>Blur slow-mo takedowns</strong>.
-              Rooms auto-lock when full so extra players watch live as <strong>Spectators</strong>!
+              Race inside the <strong>First-Person Cockpit</strong> or <strong>Car View [V]</strong> across crazy roads,
+              <strong>hidden shortcuts</strong>, drift &amp; nitro, road Special Ops &amp; <strong>Blur slow-mo takedowns</strong>.
             </p>
           </div>
 
           <div class="room-row">
-            <input class="room-input" id="race-name-input" placeholder="ENTER DRIVER NAME" maxlength="16" value="${racePlayerName}" />
+            <input class="room-input" id="race-name-input" placeholder="ENTER YOUR NAME" maxlength="16" value="${playerDisplayName}" />
             <select class="room-input" id="race-max-select" style="flex:0.65; cursor:pointer;">
               ${[1, 2, 3, 4, 6, 8].map(n => `<option value="${n}" ${selectedMaxPlayers === n ? 'selected' : ''}>Max ${n} Racer${n > 1 ? 's' : ''}</option>`).join('')}
             </select>
@@ -297,13 +443,13 @@ function renderHub() {
 
           <div class="room-box">
             <div class="btn-row">
-              <button class="btn btn-pink" id="btn-create-race">🏁 Host &amp; Start Race</button>
+              <button class="btn btn-pink" id="btn-create-race">🏁 Host Race Room</button>
             </div>
+            <div class="section-label" style="margin-bottom:0; margin-top:4px;">JOIN / SPECTATE LIVE HOSTED RACES</div>
             <div class="room-row">
-              <input class="room-input" id="join-race-input" placeholder="RACE ROOM ID (E.G. RC-4K9A)" maxlength="10" style="text-transform:uppercase;" />
-              <button class="btn btn-secondary" id="btn-join-race">Join / Spectate</button>
+              <select class="room-input" id="race-rooms-dropdown" style="cursor:pointer;"></select>
+              <button class="btn btn-secondary" id="btn-join-race">Join / Watch</button>
             </div>
-            <div id="live-rooms-host"></div>
           </div>
         </div>
       </div>
@@ -317,7 +463,7 @@ function renderHub() {
             <div class="card-title">TACTICAL STRIKE 3D</div>
             <p class="card-desc">
               Switch live between <strong>First-Person</strong> &amp; <strong>Third-Person [V]</strong>.
-              Shoot, throw grenades, punch, tactical slide, and climb cover across 4 arenas — or survive waves of front &amp; rear zombies in a dark room with your torch!
+              Shoot, throw bouncing bombs, punch, tactical slide, and climb cover across 4 arenas — or survive dark-room zombie waves with your torch!
             </p>
           </div>
           <ul class="feature-list">
@@ -331,24 +477,25 @@ function renderHub() {
         </div>
 
         <div class="stage-panel">
+          <div class="room-row">
+            <input class="room-input" id="shooter-name-input" placeholder="ENTER YOUR CALLSIGN / NAME" maxlength="16" value="${playerDisplayName}" />
+          </div>
           <div>
             <div class="section-label">SELECT MULTIPLAYER ARENA SCENE</div>
             <div class="scene-selector">
               ${scenes.map(s => `
-                <button class="scene-chip ${selectedScene === s.id ? 'active' : ''}" data-scene="${s.id}">
-                  ${s.label}
-                </button>
+                <button class="scene-chip ${selectedScene === s.id ? 'active' : ''}" data-scene="${s.id}">${s.label}</button>
               `).join('')}
             </div>
           </div>
 
           <div class="room-box">
-            <div style="font-size:0.76rem; color:#7dd3fc; font-weight:800;">MULTIPLAYER ARENA • SHARE ROOM ID</div>
             <div class="btn-row">
-              <button class="btn btn-primary" id="btn-create-room">⚔️ Create Arena Room</button>
+              <button class="btn btn-primary" id="btn-create-room">⚔️ Host Arena Room</button>
             </div>
+            <div class="section-label" style="margin-bottom:0; margin-top:4px;">JOIN LIVE HOSTED SHOOTER ROOM</div>
             <div class="room-row">
-              <input class="room-input" id="join-room-input" placeholder="ENTER ROOM ID (E.G. RM-4K9A)" maxlength="10" style="text-transform:uppercase;" />
+              <select class="room-input" id="shooter-rooms-dropdown" style="cursor:pointer;"></select>
               <button class="btn btn-secondary" id="btn-join-room">Join Room</button>
             </div>
           </div>
@@ -371,37 +518,37 @@ function renderHub() {
       <div class="hub-stage">
         <div class="stage-panel">
           <div class="hero-art-card hero-samurai">
-            <span class="card-badge badge-gold">3D Open-World Action Adventure</span>
+            <span class="card-badge badge-gold">Multi-Realm 3D Open-World Adventure</span>
             <div class="card-title">RONIN OF THE WILD</div>
             <p class="card-desc">
-              Orphaned in a shipwreck and raised by forest wolves, a lowly samurai masters <strong>Tai Chi</strong>,
-              <strong>3D wild sliding</strong>, and the <strong>Katana</strong>. Journey from the Ancient Wolf Forest across the Great Bridge,
-              don a <strong>Disguise [R]</strong> inside the guarded Imperial City, and find your true people.
+              Begin in the Ancient Wolf Forest, disguise yourself to reach the Imperial Clan Elders, then choose your portal:
+              <strong>Return to the Shipwreck Boat to save your parents</strong> OR plunge into the <strong>Astra Fiery Realm</strong>,
+              ascend to <strong>Atisashi City in the Sky</strong>, awaken the <strong>Solar Eye Laser [X]</strong>, and defeat the <strong>Mighty Dragon Emperor</strong>!
             </p>
           </div>
           <ul class="feature-list">
-            <li>📖 4-Panel Comic Backstory</li>
-            <li>🐺 Ancient Wolf Forest &amp; Den</li>
-            <li>⚔️ 3-Hit Katana &amp; Slide Slash</li>
-            <li>☯️ Tai Chi Wave &amp; Deflect</li>
-            <li>🎭 Guard Disguise &amp; Stealth</li>
-            <li>🏯 Open 3D Imperial City</li>
+            <li>🌀 Falling-Through-Portal Cinematics</li>
+            <li>⛵ Shipwreck Boat Rescue Path</li>
+            <li>🔥 Astra Fiery Land of No Return</li>
+            <li>☁️ Atisashi Sky City &amp; Moving Blocks</li>
+            <li>👁️⚡ Solar Eye Laser &amp; Dragon Boss</li>
+            <li>💾 Saved Checkpoints &amp; Random Missions</li>
           </ul>
         </div>
 
         <div class="stage-panel" style="justify-content:center;">
-          <div class="section-label">YOUR JOURNEY</div>
+          <div class="section-label">EPIC STORY PATHS &amp; CHECKPOINTS</div>
           <div class="room-box" style="gap:12px;">
-            <div style="font-size:0.86rem; color:#e2e8f0; line-height:1.55;">
-              <strong>1. Survive the Wild:</strong> Gather 3 Clan Relics in the Ancient Wolf Forest.<br/>
-              <strong>2. Claim the Disguise:</strong> Retrieve the Traveler's Straw Hat &amp; Cloak at the River Shrine.<br/>
-              <strong>3. Infiltrate the City:</strong> Toggle Disguise <strong>[R]</strong> to slip past Imperial Guards.<br/>
-              <strong>4. Reunite:</strong> Reach your Clan Elder at the northern Inner Sanctuary!
+            <div style="font-size:0.84rem; color:#e2e8f0; line-height:1.58;">
+              <strong>• Speak to the Clan Elders [F]:</strong> Opens two branching 3D Portals instead of ending the game.<br/>
+              <strong>• Path 1 — The Beginning:</strong> Fall onto the storm-tossed boat, save your parents &amp; battle the Emperor.<br/>
+              <strong>• Path 2 — Astra Realm:</strong> Fight strange creatures in the fiery abyss, escape to <strong>Atisashi Sky City</strong> (jump disconnected moving blocks, dodge obstacles), unlock the <strong>Eye Laser [X]</strong> &amp; slay the <strong>Dragon Emperor</strong>!<br/>
+              <strong>• Dynamic Missions &amp; Leveling:</strong> Complete randomized missions &amp; bosses to scale levels and earn rewards.
             </div>
             <div class="btn-row">
               <button class="btn btn-gold" id="btn-play-samurai">📖 Play Story Adventure (With Comic Intro)</button>
             </div>
-            <button class="btn btn-ghost" id="btn-play-samurai-skip">▶ Jump Straight Into 3D World</button>
+            <button class="btn btn-ghost" id="btn-play-samurai-skip">▶ Continue / Enter 3D World</button>
           </div>
         </div>
       </div>
@@ -413,14 +560,17 @@ function renderHub() {
       <div class="hub-header">
         <div>
           <div class="brand-title">AEGIS, RONIN &amp; APEX BLUR 3D</div>
-          <div class="brand-sub">Three-in-One 3D Web Game Platform • Three.js + Live Multiplayer</div>
+          <div class="brand-sub">Three-in-One 3D Web Game Platform • Cloud Multiplayer Ready</div>
         </div>
         <div class="hub-status-bar">
           <div class="id-pill" id="hub-id-pill">
             <span class="dot ${mp.connected ? '' : 'offline'}"></span>
-            YOUR ID: <span>${mp.playerId}</span>
+            ${mp.connected ? 'ONLINE' : 'CONNECTING'} • ID: <span>${mp.playerId}</span>
           </div>
           <button class="btn btn-gold" id="hub-lb-btn">🏆 Leaderboard</button>
+          <button class="btn btn-secondary" id="hub-touch-btn">
+            ${mobileControls.enabled ? '📱 Touch: ON' : '📱 Touch: OFF'}
+          </button>
           <button class="btn btn-secondary" id="hub-mute-btn">
             ${audio.muted ? '🔇 Muted [M]' : '🔊 Sound [M]'}
           </button>
@@ -445,67 +595,78 @@ function renderHub() {
         <button class="hub-tab ${activeHubTab === 'samurai' ? 'active-samurai' : ''}" data-hub-tab="samurai">
           <div>
             <div class="hub-tab-title">⚔️ RONIN OF THE WILD</div>
-            <div class="hub-tab-sub">Open-World Samurai • Tai Chi &amp; Disguise</div>
+            <div class="hub-tab-sub">Portals, Astra Sky City &amp; Dragon Boss</div>
           </div>
-          <span class="card-badge badge-gold">ADVENTURE</span>
+          <span class="card-badge badge-gold">EPIC QUEST</span>
         </button>
       </div>
 
       ${hubError ? `<div class="toast-err" style="text-align:center;">⚠️ ${hubError}</div>` : ''}
-
       ${stageHtml}
 
       <div class="hub-footer">
-        <span>Mouse + Keyboard • Pause anytime with <strong>[P]</strong> or <strong>[ESC]</strong> • Mute with <strong>[M]</strong></span>
-        <span>Sculpted 3D Models • Swept Collision • Procedural Audio &amp; Adaptive Music</span>
+        <span>Mouse + Keyboard • Pause with <strong>[P]</strong> or <strong>[ESC]</strong> • Mute with <strong>[M]</strong></span>
+        <span>Vercel Cloud Multiplayer Relay • Live Room Dropdowns • Multi-Realm Samurai RPG</span>
       </div>
     </div>
+    ${lobbyModalHtml}
     ${lbModalHtml}
   `;
 
-  // Bind Global Hub Header & Tabs
-  uiRoot.querySelector('#hub-mute-btn').onclick = () => {
-    audio.init();
-    audio.toggleMute();
-    renderHub();
-  };
-  uiRoot.querySelector('#hub-lb-btn').onclick = () => {
-    showLeaderboardModal = true;
-    mp.send({ type: 'get_race_leaderboard' });
-    renderHub();
-  };
-  const closeLb = uiRoot.querySelector('#close-lb');
-  if (closeLb) {
-    closeLb.onclick = () => {
-      showLeaderboardModal = false;
+  // Bind Lobby Modal Controls
+  const lobbyEnterBtn = uiRoot.querySelector('#lobby-enter-now');
+  if (lobbyEnterBtn && waitingLobby) {
+    lobbyEnterBtn.onclick = () => {
+      audio.init();
+      if (waitingLobby.kind === 'racing') {
+        mp.lockAndStartRace();
+      } else {
+        mp.startShooterMatch();
+      }
+    };
+  }
+  const lobbyLeaveBtn = uiRoot.querySelector('#lobby-leave');
+  if (lobbyLeaveBtn && waitingLobby) {
+    lobbyLeaveBtn.onclick = () => {
+      if (waitingLobby.kind === 'racing') mp.leaveRaceRoom();
+      else mp.leaveRoom();
+      waitingLobby = null;
       renderHub();
     };
   }
+
+  // Bind Header & Tabs
+  uiRoot.querySelector('#hub-mute-btn').onclick = () => { audio.init(); audio.toggleMute(); renderHub(); };
+  uiRoot.querySelector('#hub-touch-btn').onclick = () => {
+    mobileControls.setForceEnabled(!mobileControls.enabled);
+    document.body.classList.toggle('touch-active', mobileControls.enabled);
+    renderHub();
+  };
+  uiRoot.querySelector('#hub-lb-btn').onclick = () => { showLeaderboardModal = true; mp.send({ type: 'get_race_leaderboard' }); renderHub(); };
+  const closeLb = uiRoot.querySelector('#close-lb');
+  if (closeLb) closeLb.onclick = () => { showLeaderboardModal = false; renderHub(); };
+
   uiRoot.querySelectorAll('[data-hub-tab]').forEach(btn => {
-    btn.onclick = () => {
-      activeHubTab = btn.dataset.hubTab;
-      hubError = '';
-      renderHub();
-    };
+    btn.onclick = () => { activeHubTab = btn.dataset.hubTab; hubError = ''; renderHub(); };
   });
 
-  // Tab-specific bindings
   if (activeHubTab === 'racing') {
     const mount = uiRoot.querySelector('#car-showroom-host');
-    if (mount) {
+    if (mount && !waitingLobby) {
       carShowroom = new CarShowroom(mount, selectedCarId);
       updateCarInfoUi();
     }
     const stepCar = (dir) => {
       const idx = CAR_CATALOG.findIndex(c => c.id === selectedCarId);
-      const nextIdx = (idx + dir + CAR_CATALOG.length) % CAR_CATALOG.length;
-      selectedCarId = CAR_CATALOG[nextIdx].id;
+      selectedCarId = CAR_CATALOG[(idx + dir + CAR_CATALOG.length) % CAR_CATALOG.length].id;
       carShowroom?.selectCar(selectedCarId, dir);
       audio.playFlashlightClick();
       updateCarInfoUi();
     };
-    uiRoot.querySelector('#car-prev').onclick = () => stepCar(-1);
-    uiRoot.querySelector('#car-next').onclick = () => stepCar(1);
+    const prevBtn = uiRoot.querySelector('#car-prev');
+    const nextBtn = uiRoot.querySelector('#car-next');
+    if (prevBtn) prevBtn.onclick = () => stepCar(-1);
+    if (nextBtn) nextBtn.onclick = () => stepCar(1);
     uiRoot.querySelectorAll('[data-dot-car]').forEach(dot => {
       dot.onclick = () => {
         const curIdx = CAR_CATALOG.findIndex(c => c.id === selectedCarId);
@@ -518,63 +679,68 @@ function renderHub() {
     });
 
     const nameInp = uiRoot.querySelector('#race-name-input');
-    nameInp.oninput = () => {
-      racePlayerName = nameInp.value;
-      localStorage.setItem('apex_blur_driver_name', racePlayerName);
+    if (nameInp) nameInp.oninput = () => {
+      playerDisplayName = nameInp.value;
+      localStorage.setItem('apex_blur_driver_name', playerDisplayName);
     };
-    uiRoot.querySelector('#race-max-select').onchange = (e) => {
-      selectedMaxPlayers = Number(e.target.value) || 4;
-    };
+    const maxSel = uiRoot.querySelector('#race-max-select');
+    if (maxSel) maxSel.onchange = (e) => { selectedMaxPlayers = Number(e.target.value) || 4; };
+
     uiRoot.querySelectorAll('[data-track]').forEach(btn => {
       btn.onclick = () => {
         selectedTrackId = btn.dataset.track;
         uiRoot.querySelectorAll('[data-track]').forEach(b => b.classList.toggle('active-pink', b.dataset.track === selectedTrackId));
       };
     });
+
     uiRoot.querySelector('#btn-create-race').onclick = () => {
       audio.init();
       hubError = '';
       mp.createRaceRoom({
-        name: (racePlayerName || mp.playerId).trim(),
+        name: (playerDisplayName || mp.playerId).trim(),
         carId: selectedCarId,
         trackId: selectedTrackId,
         maxPlayers: selectedMaxPlayers
       });
     };
+
+    refreshRaceDropdown();
     uiRoot.querySelector('#btn-join-race').onclick = () => {
       audio.init();
-      const val = uiRoot.querySelector('#join-race-input').value.trim().toUpperCase();
-      if (!val) {
-        hubError = 'Enter a Race Room ID to join or spectate.';
+      const selVal = uiRoot.querySelector('#race-rooms-dropdown')?.value;
+      if (!selVal) {
+        hubError = 'Select a hosted race room from the dropdown first (or host one above!).';
         renderHub();
         return;
       }
       hubError = '';
-      mp.joinRaceRoom({ roomId: val, name: (racePlayerName || mp.playerId).trim(), carId: selectedCarId });
+      mp.joinRaceRoom({ roomId: selVal, name: (playerDisplayName || mp.playerId).trim(), carId: selectedCarId });
     };
-    updateLiveRoomsList();
   } else if (activeHubTab === 'shooter') {
+    const nameInp = uiRoot.querySelector('#shooter-name-input');
+    if (nameInp) nameInp.oninput = () => {
+      playerDisplayName = nameInp.value;
+      localStorage.setItem('apex_blur_driver_name', playerDisplayName);
+    };
     uiRoot.querySelectorAll('.scene-chip[data-scene]').forEach(btn => {
-      btn.onclick = () => {
-        selectedScene = btn.dataset.scene;
-        renderHub();
-      };
+      btn.onclick = () => { selectedScene = btn.dataset.scene; renderHub(); };
     });
     uiRoot.querySelector('#btn-create-room').onclick = () => {
       audio.init();
       hubError = '';
-      mp.createRoom(selectedScene, mp.playerId);
+      mp.createRoom(selectedScene, (playerDisplayName || mp.playerId).trim());
     };
+    refreshShooterDropdown();
     uiRoot.querySelector('#btn-join-room').onclick = () => {
       audio.init();
-      const val = uiRoot.querySelector('#join-room-input').value.trim().toUpperCase();
-      if (!val) {
-        hubError = 'Please enter a valid Shooter Room ID.';
+      const selVal = uiRoot.querySelector('#shooter-rooms-dropdown')?.value;
+      if (!selVal) {
+        hubError = 'Select a hosted shooter room from the dropdown first.';
         renderHub();
         return;
       }
       hubError = '';
-      mp.joinRoom(val, mp.playerId);
+      mp.joinRoom(selVal, (playerDisplayName || mp.playerId).trim());
     };
     uiRoot.querySelector('#btn-play-apoc').onclick = () => {
       audio.init();
@@ -595,10 +761,11 @@ function renderHub() {
   }
 }
 
-// --- LAUNCHERS ---
+// --- GAME LAUNCHERS ---
 
 function cleanupActiveGame() {
   disposeShowroom();
+  mobileControls.unmount();
   if (activeGame) {
     activeGame.dispose();
     activeGame = null;
@@ -608,6 +775,7 @@ function cleanupActiveGame() {
   isPaused = false;
   gameOverData = null;
   raceFinishData = null;
+  elderDialogueData = null;
   killFeed = [];
   currentComboMsg = '';
   currentPrompt = '';
@@ -620,7 +788,7 @@ function showComboBanner(msg) {
   comboTimer = setTimeout(() => {
     currentComboMsg = '';
     renderInGameOverlay();
-  }, 2600);
+  }, 2800);
 }
 
 function launchShooter(mode, sceneName, spawn) {
@@ -641,6 +809,7 @@ function launchShooter(mode, sceneName, spawn) {
   }, mp);
 
   activeGame.start({ mode, sceneName, spawn });
+  mobileControls.mount('shooter', activeGame);
   activeGame.requestPointerLock();
 }
 
@@ -651,6 +820,7 @@ function launchSamurai() {
     onHudUpdate: (hud) => { latestHud = hud; renderInGameOverlay(); },
     onCombo: (msg) => showComboBanner(msg),
     onDamageFlash: () => triggerDamageFlash(),
+    onElderDialogue: (data) => { elderDialogueData = data; renderInGameOverlay(); },
     onPrompt: (text) => {
       if (currentPrompt !== text) {
         currentPrompt = text;
@@ -662,6 +832,7 @@ function launchSamurai() {
   });
 
   activeGame.start();
+  mobileControls.mount('samurai', activeGame);
   activeGame.requestPointerLock();
 }
 
@@ -676,10 +847,11 @@ function launchRacing({ trackId, playerName, carId, role, roomState, joinNotice 
   }, mp);
 
   activeGame.start({ trackId, playerName, carId, role, roomState });
+  mobileControls.mount('racing', activeGame, role);
   if (joinNotice) showComboBanner(`👁️ ${joinNotice}`);
 }
 
-// --- IN-GAME HUD, SPEED GAUGE, MINIMAP, PAUSE & TROPHY ---
+// --- IN-GAME HUD, MINIMAP, ELDER DIALOGUE, CHECKPOINTS & PAUSE ---
 
 function drawSamuraiMinimap(canvas, hud) {
   if (!canvas || !hud?.playerPos) return;
@@ -690,7 +862,7 @@ function drawSamuraiMinimap(canvas, hud) {
   const cy = h / 2;
   ctx.clearRect(0, 0, w, h);
 
-  ctx.fillStyle = 'rgba(10, 20, 18, 0.9)';
+  ctx.fillStyle = hud.realm === 'astra_fire' ? 'rgba(38, 8, 8, 0.9)' : hud.realm === 'atisashi_sky' ? 'rgba(14, 34, 62, 0.9)' : 'rgba(10, 20, 18, 0.9)';
   ctx.beginPath();
   ctx.arc(cx, cy, cx - 2, 0, Math.PI * 2);
   ctx.fill();
@@ -709,7 +881,7 @@ function drawSamuraiMinimap(canvas, hud) {
 
     ctx.fillStyle = ent.color;
     ctx.beginPath();
-    ctx.arc(cx + clampedX, cy + clampedZ, ent.type === 'elder' || ent.type === 'disguise' ? 5 : 3.5, 0, Math.PI * 2);
+    ctx.arc(cx + clampedX, cy + clampedZ, ent.type === 'elder' ? 5 : 3.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -728,7 +900,7 @@ function drawSamuraiMinimap(canvas, hud) {
   ctx.fillStyle = '#fbbf24';
   ctx.font = 'bold 10px sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('N (CITY)', cx, 13);
+  ctx.fillText('NORTH', cx, 13);
 }
 
 function renderSpeedArcSvg(speedKmh, nitroActive) {
@@ -760,11 +932,10 @@ function renderInGameOverlay() {
       ? `<div class="hud-panel hud-panel-racing">
            <div style="font-weight:900; color:#f9a8d4;">${h.trackFlag} ${h.trackName} • ROOM: ${rm.roomId}</div>
            <div style="font-size:0.75rem; color:#cbd5e1; margin-top:2px;">
-             Racers: <strong>${rm.racerCount}/${rm.maxPlayers}</strong> •
-             ${rm.locked ? '<span style="color:#fbbf24;">🔒 LOCKED (Spectators Live)</span>' : '<span style="color:#4ade80;">OPEN GRID</span>'}
+             Host: <strong>${rm.hostName || 'Host'}</strong> • Racers: <strong>${rm.racerCount}/${rm.maxPlayers}</strong> •
+             ${rm.locked ? '<span style="color:#fbbf24;">🔒 LOCKED</span>' : '<span style="color:#4ade80;">OPEN</span>'}
              ${rm.spectatorCount > 0 ? ` • 👁️ ${rm.spectatorCount}` : ''}
            </div>
-           ${h.isHost && !rm.locked ? `<button class="btn btn-gold" id="btn-lock-grid" style="margin-top:6px; padding:4px 10px; font-size:0.72rem;">🔒 Lock Grid Now</button>` : ''}
          </div>`
       : '';
 
@@ -783,7 +954,6 @@ function renderInGameOverlay() {
             `).join('')}
           </div>
         </div>
-
         <div class="hud-top-center">
           ${h.role === 'spectator'
             ? `<div class="spectator-badge">👁️ LIVE SPECTATOR — WATCHING ${h.spectatingName}</div>`
@@ -795,7 +965,6 @@ function renderInGameOverlay() {
                </div>`}
           ${currentComboMsg ? `<div class="combo-banner">${currentComboMsg}</div>` : ''}
         </div>
-
         <div class="hud-top-right">
           <div class="btn-row" style="pointer-events:auto;">
             ${h.role === 'spectator'
@@ -805,7 +974,6 @@ function renderInGameOverlay() {
             <button class="btn btn-secondary" id="hud-pause" style="padding:6px 11px; font-size:0.78rem;">⏸ [P]</button>
           </div>
         </div>
-
         <div class="hud-bottom-left">
           <div class="hud-panel hud-panel-racing">
             <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.76rem; margin-bottom:4px;">
@@ -820,20 +988,13 @@ function renderInGameOverlay() {
             ` : ''}
           </div>
         </div>
-
         <div class="hud-bottom-center">
           <div class="shortcut-strip">
             ${h.role === 'spectator'
               ? `<span><kbd>Tab</kbd> Next Racer</span><span><kbd>M</kbd> Mute</span><span><kbd>P</kbd> Menu</span>`
-              : `<span><kbd>WASD</kbd> Drive</span>
-                 <span><kbd>Space</kbd> Drift</span>
-                 <span><kbd>Shift</kbd> Nitro</span>
-                 <span><kbd>LMB/F</kbd> Shoot</span>
-                 <span><kbd>RMB/E</kbd> Special Op</span>
-                 <span><kbd>V</kbd> Cockpit/Car</span>`}
+              : `<span><kbd>WASD</kbd> Drive</span><span><kbd>Space</kbd> Drift</span><span><kbd>Shift</kbd> Nitro</span><span><kbd>LMB/F</kbd> Shoot</span><span><kbd>RMB/E</kbd> Special Op</span><span><kbd>V</kbd> Cockpit/Car</span>`}
           </div>
         </div>
-
         <div class="hud-bottom-right">
           <div class="hud-panel">
             <div class="speed-gauge-box">
@@ -859,7 +1020,7 @@ function renderInGameOverlay() {
     const roomInfo = h.mode === 'arena' && h.roomState
       ? `<div class="hud-panel hud-panel-shooter">
            <div style="font-weight:900; color:#38bdf8;">ROOM: ${h.roomState.roomId} • ${h.roomState.routingLabel}</div>
-           <div style="font-size:0.75rem; color:#cbd5e1;">ID: ${h.playerId} • Players: ${h.roomState.players.length} • ${h.sceneName.toUpperCase()}</div>
+           <div style="font-size:0.75rem; color:#cbd5e1;">Host: ${h.roomState.hostName || 'Host'} • Players: ${h.roomState.players.length} • ${h.sceneName.toUpperCase()}</div>
          </div>`
       : `<div class="hud-panel hud-panel-shooter">
            <div style="font-weight:900; color:#fda4af;">☣️ APOCALYPSE LEVEL ${h.level}</div>
@@ -869,15 +1030,9 @@ function renderInGameOverlay() {
     hudHtml = `
       <div class="hud-layer">
         <div class="damage-vignette ${damageFlashActive ? 'flash' : ''}"></div>
-        <div class="crosshair">
-          <span class="ch-t"></span><span class="ch-b"></span><span class="ch-l"></span><span class="ch-r"></span><span class="ch-dot"></span>
-        </div>
+        <div class="crosshair"><span class="ch-t"></span><span class="ch-b"></span><span class="ch-l"></span><span class="ch-r"></span><span class="ch-dot"></span></div>
         <div class="hitmarker ${hitMarkerActive ? 'show' : ''}">✕</div>
-
-        <div class="hud-top-left">
-          ${roomInfo}
-          ${h.mode === 'apocalypse' ? `<div class="hud-panel lives-row">${livesHearts}</div>` : ''}
-        </div>
+        <div class="hud-top-left">${roomInfo}${h.mode === 'apocalypse' ? `<div class="hud-panel lives-row">${livesHearts}</div>` : ''}</div>
         <div class="hud-top-center">
           <div class="hud-panel hud-stat-row">
             ${h.mode === 'arena' ? `<span>⏱ ${h.timerStr}</span><span>LVL ${h.level}</span>` : `<span>WAVE ${h.level}</span>`}
@@ -896,23 +1051,13 @@ function renderInGameOverlay() {
         </div>
         <div class="hud-bottom-left">
           <div class="hud-panel hud-panel-shooter">
-            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.78rem; margin-bottom:5px;">
-              <span>ARMOR &amp; HEALTH</span><span>${h.hp}/${h.maxHp}</span>
-            </div>
+            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.78rem; margin-bottom:5px;"><span>ARMOR &amp; HEALTH</span><span>${h.hp}/${h.maxHp}</span></div>
             <div class="bar-wrap"><div class="bar-fill bar-hp" style="width:${(h.hp / h.maxHp) * 100}%"></div></div>
           </div>
         </div>
         <div class="hud-bottom-center">
           <div class="shortcut-strip">
-            <span><kbd>WASD</kbd> Move</span>
-            <span><kbd>LMB</kbd> Shoot</span>
-            <span><kbd>RMB</kbd> Aim</span>
-            <span><kbd>G</kbd> Bomb</span>
-            <span><kbd>E</kbd> Punch</span>
-            <span><kbd>Shift+C</kbd> Slide</span>
-            <span><kbd>F</kbd> Torch ${h.torchOn ? 'ON' : 'OFF'}</span>
-            <span><kbd>V</kbd> ${h.thirdPerson ? '3rd' : '1st'} View</span>
-            <span><kbd>1-3</kbd> Guns</span>
+            <span><kbd>WASD</kbd> Move</span><span><kbd>LMB</kbd> Shoot</span><span><kbd>RMB</kbd> Aim</span><span><kbd>G</kbd> Bomb</span><span><kbd>E</kbd> Punch</span><span><kbd>Shift+C</kbd> Slide</span><span><kbd>F</kbd> Torch</span><span><kbd>V</kbd> View</span><span><kbd>1-3</kbd> Guns</span>
           </div>
         </div>
         <div class="hud-bottom-right">
@@ -927,30 +1072,51 @@ function renderInGameOverlay() {
       </div>
     `;
   } else {
+    // SAMURAI MULTI-REALM RPG HUD
+    const rm = h.randomMission;
     hudHtml = `
       <div class="hud-layer">
         <div class="damage-vignette ${damageFlashActive ? 'flash' : ''}"></div>
         <div class="hud-top-left">
-          <div class="hud-panel hud-panel-samurai" style="max-width:365px;">
-            <div style="font-weight:900; color:#fbbf24; font-size:0.86rem;">🏯 ${h.zone.toUpperCase()}</div>
-            <div style="font-size:0.8rem; color:#f1f5f9; margin-top:4px;"><strong>Quest:</strong> ${h.objective}</div>
-            <div style="font-size:0.76rem; color:#94a3b8; margin-top:5px;">
-              Clan Relics: <strong style="color:#fbbf24;">${h.relicsFound}/${h.totalRelics}</strong> •
-              Disguise: <strong style="color:${h.disguised ? '#2dd4bf' : h.hasDisguise ? '#fbbf24' : '#94a3b8'};">
-                ${h.disguised ? 'ACTIVE (STEALTH)' : h.hasDisguise ? 'READY [R]' : 'NOT FOUND'}
-              </strong>
+          <div class="hud-panel hud-panel-samurai" style="max-width:380px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-weight:900; color:#fbbf24; font-size:0.86rem;">🏯 ${h.zone.toUpperCase()}</span>
+              <span style="font-size:0.74rem; color:#fde047; font-weight:900;">LV.${h.level} • 🪙 ${h.gold}</span>
+            </div>
+            <div style="font-size:0.79rem; color:#f1f5f9; margin-top:4px;"><strong>Story:</strong> ${h.objective}</div>
+            <div style="font-size:0.73rem; color:#94a3b8; margin-top:4px;">
+              💾 Checkpoint: <strong style="color:#7dd3fc;">${h.checkpointLabel}</strong> •
+              ${h.hasEyeLaser ? '<strong style="color:#38bdf8;">👁️⚡ EYE LASER READY [X]</strong>' : `Disguise: <strong>${h.disguised ? 'ACTIVE' : h.hasDisguise ? 'READY [R]' : 'LOCKED'}</strong>`}
             </div>
           </div>
+          ${rm ? `
+            <div class="hud-panel mission-card" style="max-width:380px;">
+              <div style="font-weight:900; color:#2dd4bf;">🎯 BONUS MISSION (${rm.progress}/${rm.target})</div>
+              <div style="color:#e2e8f0; margin-top:2px;">${rm.title}</div>
+              <div style="color:#94a3b8; font-size:0.72rem; margin-top:2px;">Reward: +${rm.rewardXp} XP • +${rm.rewardGold} Gold • Heal</div>
+            </div>
+          ` : ''}
           ${h.suspicion > 0 ? `
             <div class="hud-panel">
-              <div style="font-size:0.75rem; font-weight:900; color:#fca5a5; margin-bottom:4px;">👁️ GUARD SUSPICION: ${h.suspicion}%</div>
+              <div style="font-size:0.74rem; font-weight:900; color:#fca5a5; margin-bottom:4px;">👁️ GUARD SUSPICION: ${h.suspicion}%</div>
               <div class="bar-wrap"><div class="bar-fill bar-sus" style="width:${h.suspicion}%"></div></div>
             </div>
           ` : ''}
         </div>
+
         <div class="hud-top-center">
+          ${h.activeBoss ? `
+            <div class="boss-bar-wrap">
+              <div style="display:flex; justify-content:space-between; font-size:0.8rem; font-weight:900; color:#fda4af;">
+                <span>🔥 ${h.activeBoss.name}</span>
+                <span>${h.activeBoss.hp} / ${h.activeBoss.maxHp}</span>
+              </div>
+              <div class="boss-bar-track"><div class="boss-bar-fill" style="width:${(h.activeBoss.hp / h.activeBoss.maxHp) * 100}%"></div></div>
+            </div>
+          ` : ''}
           ${currentComboMsg ? `<div class="combo-banner">${currentComboMsg}</div>` : ''}
         </div>
+
         <div class="hud-top-right">
           <div class="btn-row" style="pointer-events:auto;">
             <button class="btn btn-secondary" id="hud-mute" style="padding:6px 11px; font-size:0.78rem;">${audio.muted ? '🔇' : '🔊'}</button>
@@ -958,27 +1124,28 @@ function renderInGameOverlay() {
           </div>
           <canvas id="samurai-minimap" class="minimap-canvas" width="128" height="128"></canvas>
         </div>
+
         <div class="hud-bottom-left">
           <div class="hud-panel hud-panel-samurai">
-            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.76rem; margin-bottom:4px;">
-              <span>VITALITY</span><span>${h.hp}/${h.maxHp}</span>
-            </div>
-            <div class="bar-wrap" style="margin-bottom:8px;"><div class="bar-fill bar-hp" style="width:${(h.hp / h.maxHp) * 100}%"></div></div>
-            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.76rem; margin-bottom:4px;">
-              <span style="color:#2dd4bf;">☯️ TAI CHI SPIRIT</span><span>${h.chi}/${h.maxChi}</span>
-            </div>
-            <div class="bar-wrap"><div class="bar-fill bar-chi" style="width:${(h.chi / h.maxChi) * 100}%"></div></div>
+            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.75rem; margin-bottom:4px;"><span>VITALITY</span><span>${h.hp}/${h.maxHp}</span></div>
+            <div class="bar-wrap" style="margin-bottom:7px;"><div class="bar-fill bar-hp" style="width:${(h.hp / h.maxHp) * 100}%"></div></div>
+            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:0.75rem; margin-bottom:4px;"><span style="color:#2dd4bf;">☯️ TAI CHI SPIRIT</span><span>${h.chi}/${h.maxChi}</span></div>
+            <div class="bar-wrap" style="margin-bottom:7px;"><div class="bar-fill bar-chi" style="width:${(h.chi / h.maxChi) * 100}%"></div></div>
+            <div style="font-size:0.7rem; color:#fde047; font-weight:800;">XP: ${h.xp} / ${h.xpNext} (Level ${h.level})</div>
           </div>
         </div>
+
         <div class="hud-bottom-center">
           ${currentPrompt ? `<div class="prompt-pill">${currentPrompt}</div>` : ''}
           <div class="shortcut-strip">
             <span><kbd>WASD</kbd> Move</span>
+            <span><kbd>Space</kbd> Jump</span>
             <span><kbd>LMB</kbd> 3-Hit Katana</span>
-            <span><kbd>RMB/Q</kbd> Tai Chi Wave</span>
+            <span><kbd>RMB/Q</kbd> Tai Chi</span>
             <span><kbd>E</kbd> Deflect</span>
-            <span><kbd>C</kbd> 3D Slide</span>
+            <span><kbd>C</kbd> Slide</span>
             <span><kbd>R</kbd> Disguise</span>
+            ${h.hasEyeLaser ? `<span><kbd>X</kbd> <strong>EYE LASER</strong></span>` : ''}
             <span><kbd>F</kbd> Interact</span>
           </div>
         </div>
@@ -987,7 +1154,37 @@ function renderInGameOverlay() {
   }
 
   let modalHtml = '';
-  if (raceFinishData) {
+  if (elderDialogueData) {
+    modalHtml = `
+      <div class="modal-backdrop">
+        <div class="modal-card">
+          <span class="card-badge badge-gold">🏯 CLAN ELDERS' SANCTUARY</span>
+          <div class="modal-title" style="color:#fbbf24;">"Young Ronin... You Survived the Wolves."</div>
+          <p style="color:#e2e8f0; font-size:0.9rem; line-height:1.58;">
+            <em>"The tyrant who sank your family's ship is no mortal man — he is the <strong>Mighty Dragon Emperor</strong> ruling from the floating skies.
+            We hold two ancient portals of fate. Step through either portal and forge your legend:"</em>
+          </p>
+          <div class="elder-choice-grid">
+            <button class="elder-choice-card elder-choice-ocean" id="elder-choose-beginning">
+              <div style="font-size:1.5rem;">🌊⛵</div>
+              <div style="font-weight:900; color:#7dd3fc; font-size:0.96rem;">PATH 1: START AT THE BEGINNING</div>
+              <p style="font-size:0.8rem; color:#cbd5e1; line-height:1.45;">
+                Fall through the Time Portal back onto the stormy shipwreck boat! Fight the raiders, <strong>save your parents</strong>, continue through the wolf saga, unlock checkpoints, and march against the Emperor!
+              </p>
+            </button>
+            <button class="elder-choice-card elder-choice-astra" id="elder-choose-astra">
+              <div style="font-size:1.5rem;">🔥☁️🐉</div>
+              <div style="font-weight:900; color:#fdba74; font-size:0.96rem;">PATH 2: ENTER THE ASTRA REALM</div>
+              <p style="font-size:0.8rem; color:#cbd5e1; line-height:1.45;">
+                Plunge into the Fiery Land of No Return! Battle strange astral creatures &amp; the Magma Warden, ascend to <strong>Atisashi City in the Sky</strong>, ride moving sky blocks, awaken the <strong>Solar Eye Laser [X]</strong>, and defeat the <strong>Mighty Dragon Emperor</strong>!
+              </p>
+            </button>
+          </div>
+          <button class="btn btn-ghost" id="elder-close">Keep Exploring Imperial City First</button>
+        </div>
+      </div>
+    `;
+  } else if (raceFinishData) {
     const r = raceFinishData;
     modalHtml = `
       <div class="modal-backdrop">
@@ -996,22 +1193,11 @@ function renderInGameOverlay() {
             <div class="trophy-icon">${r.won ? '🏆' : r.position === 2 ? '🥈' : r.position === 3 ? '🥉' : '🏁'}</div>
             <div class="modal-title" style="color:#fbbf24;">${r.won ? 'CHAMPIONSHIP TROPHY WON!' : `FINISHED ${formatOrdinal(r.position).toUpperCase()} PLACE!`}</div>
             <div style="color:#cbd5e1; font-size:0.9rem;"><strong>${r.playerName}</strong> (${r.carName}) • ${r.trackName}</div>
-            ${r.won ? `<div style="color:#4ade80; font-size:0.82rem; font-weight:800;">✨ Recorded on the Global Trophy Leaderboard!</div>` : ''}
           </div>
           <div class="stats-grid">
             <div class="stat-box"><div class="stat-val">${formatSec(r.timeSec)}</div><div class="stat-lbl">Official Race Time</div></div>
             <div class="stat-box"><div class="stat-val">${r.takedowns}</div><div class="stat-lbl">Cars Eliminated</div></div>
           </div>
-          <table class="lb-table">
-            <thead><tr><th>Pos</th><th>Driver</th><th>Car</th><th>Takedowns</th></tr></thead>
-            <tbody>
-              ${r.standings.map(st => `
-                <tr style="${st.isPlayer ? 'background:rgba(236,72,153,0.22); font-weight:800;' : ''}">
-                  <td>${formatOrdinal(st.pos)}</td><td>${st.name}</td><td>${st.carName}</td><td>${st.takedowns}</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
           <div class="btn-row">
             <button class="btn btn-pink" id="modal-restart">Race Again</button>
             <button class="btn btn-gold" id="modal-open-lb">🏆 Leaderboard</button>
@@ -1025,50 +1211,29 @@ function renderInGameOverlay() {
       <div class="modal-backdrop">
         <div class="modal-card">
           <div class="modal-title" style="color:#fbbf24;">${gameOverData.title}</div>
-          <p style="color:#cbd5e1; font-size:0.95rem;">${gameOverData.subtitle}</p>
+          <p style="color:#cbd5e1; font-size:0.94rem;">${gameOverData.subtitle}</p>
           <div class="stats-grid">
             ${gameOverData.stats.map(st => `<div class="stat-box"><div class="stat-val">${st.value}</div><div class="stat-lbl">${st.label}</div></div>`).join('')}
           </div>
           <div class="btn-row">
-            <button class="btn btn-primary" id="modal-restart">Play Again</button>
+            <button class="btn btn-primary" id="modal-restart">Continue / Play Again</button>
             <button class="btn btn-secondary" id="modal-hub">Main Hub</button>
           </div>
         </div>
       </div>
     `;
   } else if (isPaused) {
-    const combos = activeGameType === 'racing'
-      ? [
-          ['W / S / A / D', 'Accelerate, Brake & Steer'],
-          ['Space + Turn', 'Power Drift (+Bonus Nitro)'],
-          ['Shift or N', 'Ignite Nitro Speed Boost'],
-          ['LMB or F', 'Shoot Hood Pulse Blasters'],
-          ['RMB or E', 'Deploy Road Special Op'],
-          ['V Key', 'Toggle Cockpit / Car Chase View'],
-          ['Green Gates', 'Hidden Shortcuts (+Slow-Mo Boost)'],
-          ['Ram High Speed', 'Elastic Car-to-Car Ram Takedown']
-        ]
-      : activeGameType === 'shooter'
-        ? [
-            ['Shift + C', 'Tactical Power Slide'],
-            ['Space + G', 'Air-Burst Long Bomb Throw'],
-            ['Slide + LMB', '1.45x Slide Shot Damage'],
-            ['Slide + E', 'Tactical Slide Melee Bash'],
-            ['V Key', 'Toggle 1st / 3rd Person View'],
-            ['F Key', 'Toggle Torch / Flashlight'],
-            ['1 / 2 / 3', 'Rifle / Shotgun / Pistol'],
-            ['Space + Cover', 'Climb / Jump Onto Crates & Cars']
-          ]
-        : [
-            ['LMB x3', '3-Hit Whirlwind Katana Combo'],
-            ['C + LMB', 'Wild Fang 3D Slide Slash'],
-            ['RMB or Q', 'Tai Chi Flowing Palm Wave'],
-            ['E Key', 'Tai Chi Harmony Deflect (+HP)'],
-            ['R Key', 'Toggle Traveler\'s Disguise'],
-            ['F Key', 'Collect Relics / Talk to Elder'],
-            ['Shift / Space', 'Sprint / High Jump'],
-            ['M / P', 'Mute Audio / Pause Game']
-          ];
+    const checkpointHtml = activeGameType === 'samurai' && h.unlockedCheckpoints?.length
+      ? `
+        <div>
+          <div class="section-label">💾 SAVED CHECKPOINTS (FAST TRAVEL / RETURN)</div>
+          <div class="checkpoint-grid">
+            ${h.unlockedCheckpoints.map(cp => `
+              <button class="scene-chip" data-tp-cp="${cp.id}">📍 ${cp.label}</button>
+            `).join('')}
+          </div>
+        </div>
+      ` : '';
 
     const sceneSwitchHtml = activeGameType === 'shooter' && h.mode === 'arena'
       ? `
@@ -1089,22 +1254,21 @@ function renderInGameOverlay() {
             <div class="modal-title">GAME PAUSED</div>
             ${(activeGameType === 'shooter' || activeGameType === 'racing')
               ? `<button class="btn btn-secondary" id="pause-cam-btn">
-                   ${activeGameType === 'racing'
-                     ? `View: ${h.cameraMode === 'fps' ? 'Inside Cockpit' : 'Car Chase'} [V]`
-                     : `View: ${h.thirdPerson ? '3rd Person' : '1st Person'} [V]`}
+                   ${activeGameType === 'racing' ? `View: ${h.cameraMode === 'fps' ? 'Cockpit' : 'Car Chase'} [V]` : `View: ${h.thirdPerson ? '3rd' : '1st'} Person [V]`}
                  </button>`
               : ''}
           </div>
           <div class="slider-row"><span>🎵 Background Music</span><input type="range" id="vol-music" min="0" max="1" step="0.05" value="${audio.musicVolume}" /></div>
-          <div class="slider-row"><span>💥 Weapon, Engine &amp; Action SFX</span><input type="range" id="vol-sfx" min="0" max="1" step="0.05" value="${audio.sfxVolume}" /></div>
-          ${sceneSwitchHtml}
-          <div>
-            <div class="section-label">SHORTCUTS &amp; COMBOS</div>
-            <div class="combos-grid">${combos.map(([k, d]) => `<div class="combo-row"><strong>${k}</strong><span>${d}</span></div>`).join('')}</div>
+          <div class="slider-row"><span>💥 Action &amp; Engine SFX</span><input type="range" id="vol-sfx" min="0" max="1" step="0.05" value="${audio.sfxVolume}" /></div>
+          <div class="slider-row">
+            <span>📱 Mobile Touch Controls</span>
+            <button class="btn btn-secondary" id="pause-touch-btn" style="padding:6px 14px; font-size:0.78rem;">${mobileControls.enabled ? 'ENABLED' : 'DISABLED'}</button>
           </div>
+          ${checkpointHtml}
+          ${sceneSwitchHtml}
           <div class="btn-row">
             <button class="btn btn-primary" id="modal-resume">▶ Resume</button>
-            <button class="btn btn-secondary" id="modal-restart">↻ Restart</button>
+            <button class="btn btn-secondary" id="modal-restart">↻ Respawn / Restart</button>
             <button class="btn btn-danger" id="modal-hub">Main Hub</button>
           </div>
         </div>
@@ -1113,6 +1277,9 @@ function renderInGameOverlay() {
   }
 
   uiRoot.innerHTML = hudHtml + modalHtml;
+
+  // Hide mobile touch overlay while any modal (Pause, Elder Dialogue, Trophy, Game Over) is open!
+  mobileRoot.style.display = modalHtml ? 'none' : 'block';
 
   if (h.game === 'samurai') {
     drawSamuraiMinimap(uiRoot.querySelector('#samurai-minimap'), h);
@@ -1123,7 +1290,25 @@ function renderInGameOverlay() {
   bind('#hud-pause', (e) => { e.stopPropagation(); activeGame.setPaused(!isPaused); });
   bind('#hud-cam-btn', (e) => { e.stopPropagation(); activeGame.toggleCameraView(); });
   bind('#hud-spec-next', (e) => { e.stopPropagation(); activeGame.cycleSpectateTarget(); });
-  bind('#btn-lock-grid', (e) => { e.stopPropagation(); mp.lockAndStartRace(); });
+
+  // Elder Portal Choice Bindings!
+  bind('#elder-choose-beginning', () => {
+    elderDialogueData = null;
+    isPaused = false;
+    activeGame.chooseElderPath('beginning');
+    renderInGameOverlay();
+  });
+  bind('#elder-choose-astra', () => {
+    elderDialogueData = null;
+    isPaused = false;
+    activeGame.chooseElderPath('astra');
+    renderInGameOverlay();
+  });
+  bind('#elder-close', () => {
+    elderDialogueData = null;
+    activeGame.setPaused(false);
+    activeGame.requestPointerLock?.();
+  });
 
   bind('#modal-resume', () => { activeGame.setPaused(false); activeGame.requestPointerLock?.(); });
   bind('#modal-restart', () => {
@@ -1138,6 +1323,20 @@ function renderInGameOverlay() {
     mp.leaveRoom(); mp.leaveRaceRoom(); cleanupActiveGame(); audio.playMusic('menu'); renderHub();
   });
   bind('#pause-cam-btn', () => { activeGame.toggleCameraView(); renderInGameOverlay(); });
+  bind('#pause-touch-btn', () => {
+    mobileControls.setForceEnabled(!mobileControls.enabled);
+    document.body.classList.toggle('touch-active', mobileControls.enabled);
+    if (activeGame) mobileControls.mount(activeGameType, activeGame, latestHud?.role || 'racer');
+    renderInGameOverlay();
+  });
+
+  uiRoot.querySelectorAll('[data-tp-cp]').forEach(btn => {
+    btn.onclick = () => {
+      isPaused = false;
+      activeGame.teleportToCheckpoint(btn.dataset.tpCp);
+      activeGame.requestPointerLock?.();
+    };
+  });
 
   const volM = uiRoot.querySelector('#vol-music');
   if (volM) volM.oninput = () => audio.setMusicVolume(parseFloat(volM.value));

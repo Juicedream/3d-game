@@ -3,15 +3,28 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { handleMultiplayerAction } from './api/multiplayer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 const PORT = process.env.PORT || 3000;
+
+// Expose Vercel-compatible HTTP Multiplayer Relay locally too!
+app.all('/api/multiplayer', async (req, res) => {
+  try {
+    const body = req.method === 'GET' ? { type: 'directory' } : (req.body || {});
+    const result = await handleMultiplayerAction(body);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || 'Relay error' });
+  }
+});
 
 app.use(express.static(path.join(__dirname, 'dist')));
 
